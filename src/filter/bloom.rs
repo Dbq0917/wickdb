@@ -18,26 +18,90 @@
 use crate::filter::FilterPolicy;
 use crate::util::hash::hash;
 
+/// The default target false positive rate (1%).
+pub const DEFAULT_FALSE_POSITIVE_RATE: f64 = 0.01;
+
+// ln(2), used to derive the optimal number of hash functions.
+const LN_2: f64 = core::f64::consts::LN_2;
+
+// The smallest filter size (in bits) we are willing to build. For a tiny
+// number of keys the theoretical size would make the false positive rate
+// explode, so we enforce a minimum length instead.
+const MIN_FILTER_BITS: usize = 64;
+
+// Clamp the probe count into the range supported by the on-disk encoding
+// (a single unsigned byte, with 31+ reserved for future encodings).
+const MIN_HASH_FUNCS: usize = 1;
+const MAX_HASH_FUNCS: usize = 30;
+
 pub struct BloomFilter {
     // the hash count for a key
     k: usize,
+    // the target false positive rate used to derive `bits_per_key`
+    false_positive_rate: f64,
     bits_per_key: usize,
 }
 
 impl BloomFilter {
+    /// Creates a bloom filter whose bit array uses a fixed `bits_per_key`
+    /// value. Prefer [`BloomFilter::with_false_positive_rate`] so that the
+    /// bit budget is derived from a target false positive rate instead of a
+    /// hand-picked constant.
     pub fn new(bits_per_key: usize) -> Self {
-        // 0.69 =~ ln(2) and we intentionally round down to reduce probing cost a little bit
-        let mut k = bits_per_key as f32 * 0.69;
-        if k > 30f32 {
-            k = 30f32;
-        } else if k < 1f32 {
-            k = 1f32;
-        }
+        let k = Self::optimal_hash_count(bits_per_key);
         Self {
-            k: k as usize,
+            k,
+            false_positive_rate: DEFAULT_FALSE_POSITIVE_RATE,
             bits_per_key,
         }
     }
+
+    /// Creates a bloom filter sized to keep the false positive rate close to
+    /// `false_positive_rate`. The required bits per key are derived from the
+    /// target rate with the standard bloom filter formula
+    /// `m/n = -ln(p) / (ln(2)^2)`.
+    ///
+    /// The actual bit array is still computed per filter group from the real
+    /// number of keys observed when the group is built (see
+    /// [`BloomFilter::create_filter`]), so a dataset that grows to several
+    /// times the originally expected size keeps the same false positive rate
+    /// rather than degrading as it would with a fixed-size bit array.
+    pub fn with_false_positive_rate(false_positive_rate: f64) -> Self {
+        let rate = false_positive_rate.clamp(f64::MIN_POSITIVE, 1.0);
+        let bits_per_key = Self::optimal_bits_per_key(rate);
+        let k = Self::optimal_hash_count(bits_per_key);
+        Self {
+            k,
+            false_positive_rate: rate,
+            bits_per_key,
+        }
+    }
+
+    /// Returns the configured target false positive rate.
+    pub fn false_positive_rate(&self) -> f64 {
+        self.false_positive_rate
+    }
+
+    /// Returns the bits allocated per key.
+    pub fn bits_per_key(&self) -> usize {
+        self.bits_per_key
+    }
+
+    // m/n = -ln(p) / (ln(2) ^ 2), rounded up so that the achieved rate never
+    // exceeds the requested one.
+    fn optimal_bits_per_key(false_positive_rate: f64) -> usize {
+        let bits = -false_positive_rate.ln() / (LN_2 * LN_2);
+        bits.ceil() as usize
+    }
+
+    // k = (m/n) * ln(2). We intentionally round down to keep the probing cost
+    // a little bit lower, matching the original leveldb behaviour.
+    fn optimal_hash_count(bits_per_key: usize) -> usize {
+        ((bits_per_key as f64) * LN_2)
+            .floor()
+            .clamp(MIN_HASH_FUNCS as f64, MAX_HASH_FUNCS as f64) as usize
+    }
+
     fn bloom_hash(data: &[u8]) -> u32 {
         hash(data, 0xc6a4a793)
     }
@@ -76,13 +140,16 @@ impl FilterPolicy for BloomFilter {
     }
 
     fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8> {
-        // Compute bloom filter size (in both bits and bytes)
+        // Compute the bloom filter size (in both bits and bytes) from the
+        // actual number of keys in this filter group. Because every group is
+        // sized independently, the filter grows and shrinks with the real key
+        // count instead of being pinned to a fixed number of bits.
         let mut bits = keys.len() * self.bits_per_key;
 
-        // For small n, we can see a very high false positive rate.  Fix it
+        // For small n, we can see a very high false positive rate. Fix it
         // by enforcing a minimum bloom filter length.
-        if bits < 64 {
-            bits = 64;
+        if bits < MIN_FILTER_BITS {
+            bits = MIN_FILTER_BITS;
         };
         let bytes = (bits + 7) / 8;
         bits = bytes * 8; // round to multi 8
@@ -116,8 +183,12 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
+            Self::with_policy(Box::new(BloomFilter::new(10)))
+        }
+
+        fn with_policy(policy: Box<dyn FilterPolicy>) -> Self {
             Self {
-                policy: Box::new(BloomFilter::new(10)),
+                policy,
                 filter: vec![],
                 keys: vec![],
             }
@@ -244,6 +315,103 @@ mod tests {
         assert!(
             mediocre <= good / 5,
             "mediocre false positive rate is more than expected"
+        );
+    }
+
+    #[test]
+    fn test_bits_per_key_derived_from_target_rate() {
+        let bf = BloomFilter::with_false_positive_rate(DEFAULT_FALSE_POSITIVE_RATE);
+        // -ln(0.01) / (ln(2)^2) ~= 9.59, rounded up to 10 bits/key
+        assert_eq!(bf.bits_per_key(), 10);
+        // k = floor(10 * ln(2)) = 6
+        assert_eq!(bf.k, 6);
+        assert_eq!(bf.false_positive_rate(), DEFAULT_FALSE_POSITIVE_RATE);
+
+        // A tighter target rate must allocate more bits per key.
+        let tighter = BloomFilter::with_false_positive_rate(0.001);
+        assert!(tighter.bits_per_key() > bf.bits_per_key());
+
+        // Out-of-range rates are clamped instead of producing invalid sizes.
+        let clamped = BloomFilter::with_false_positive_rate(0.0);
+        assert!(clamped.bits_per_key() >= 1);
+        assert!(clamped.k >= 1 && clamped.k <= 30);
+    }
+
+    // Builds a filter over `inserted` encoded keys and probes it with `probes`
+    // keys that are guaranteed not to be part of the original set. Returns the
+    // observed false positive rate.
+    fn measure_false_positive_rate(policy: &dyn FilterPolicy, inserted: usize, probes: u64) -> f64 {
+        let mut keys = Vec::with_capacity(inserted);
+        for i in 0..inserted as u64 {
+            keys.push(i.to_le_bytes().to_vec());
+        }
+        let filter = policy.create_filter(&keys);
+
+        // Probe keys live in a disjoint range so they can never collide with
+        // an inserted key.
+        let mut false_positives = 0u64;
+        for i in 0..probes {
+            let probe = (i + 1_000_000_000).to_le_bytes();
+            if policy.may_contain(&filter, &probe) {
+                false_positives += 1;
+            }
+        }
+        false_positives as f64 / probes as f64
+    }
+
+    #[test]
+    fn test_false_positive_rate_100k_probes() {
+        // The read path probes the filter 100,000 times. With the default 1%
+        // target rate roughly 1,000 probes may be false positives; allow
+        // headroom up to 1.5% for the finite-size filter instead of pinning
+        // the exact asymptotic value.
+        let probes = 100_000u64;
+        let bf = BloomFilter::with_false_positive_rate(DEFAULT_FALSE_POSITIVE_RATE);
+        let rate = measure_false_positive_rate(&bf, 10_000, probes);
+        assert!(
+            rate <= 0.015,
+            "false positive rate {} exceeds 1.5% over {} probes",
+            rate,
+            probes
+        );
+
+        // Every inserted key must always be reported as present.
+        let keys: Vec<Vec<u8>> = (0..10_000u64).map(|i| i.to_le_bytes().to_vec()).collect();
+        let filter = bf.create_filter(&keys);
+        for key in &keys {
+            assert!(bf.may_contain(&filter, key));
+        }
+    }
+
+    #[test]
+    fn test_filter_sized_from_actual_key_count() {
+        // Simulate a filter group that was configured for `base` keys but ends
+        // up holding 3x as many keys.
+        let base = 10_000usize;
+        let grown = base * 3;
+        let probes = 100_000u64;
+
+        // A fixed bit budget pinned to the originally expected key count: the
+        // same number of bits is shared by 3x more keys, so the false positive
+        // rate climbs well beyond the configured 1%.
+        let fixed_budget = BloomFilter::new(10 / 3);
+        let fixed_rate = measure_false_positive_rate(&fixed_budget, grown, probes);
+
+        // Sizing the filter from the actual key count keeps the rate near the
+        // 1% target regardless of how much the dataset grew.
+        let adaptive = BloomFilter::with_false_positive_rate(DEFAULT_FALSE_POSITIVE_RATE);
+        let adaptive_rate = measure_false_positive_rate(&adaptive, grown, probes);
+
+        assert!(
+            adaptive_rate <= 0.015,
+            "adaptive filter false positive rate {} exceeds 1.5%",
+            adaptive_rate
+        );
+        assert!(
+            fixed_rate > adaptive_rate,
+            "fixed-size filter ({}) should degrade compared with the adaptive one ({}, 1% target)",
+            fixed_rate,
+            adaptive_rate
         );
     }
 }

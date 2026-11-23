@@ -227,7 +227,14 @@ impl<C: Comparator> Options<C> {
         if let Some(fp) = std::mem::replace(&mut self.filter_policy, None) {
             self.filter_policy = Some(Arc::new(InternalFilterPolicy::new(fp)));
         } else {
-            let bf = BloomFilter::new(10);
+            // Size the default bloom filter from a 1% false positive target
+            // instead of a hard-coded bits/key constant. The per-group filter
+            // is still built from the actual key count at flush time and is
+            // persisted inside the sstable, so reopening the DB reuses it
+            // directly without rebuilding anything.
+            let bf = BloomFilter::with_false_positive_rate(
+                crate::filter::bloom::DEFAULT_FALSE_POSITIVE_RATE,
+            );
             self.filter_policy = Some(Arc::new(InternalFilterPolicy::new(Arc::new(bf))))
         }
     }

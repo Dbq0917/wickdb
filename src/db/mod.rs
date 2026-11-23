@@ -1547,7 +1547,9 @@ mod tests {
                 o
             }
             TestOption::FilterPolicy => {
-                let filter = BloomFilter::new(10);
+                let filter = BloomFilter::with_false_positive_rate(
+                    crate::filter::bloom::DEFAULT_FALSE_POSITIVE_RATE,
+                );
                 let mut o = Options::default();
                 o.filter_policy = Some(Arc::new(filter));
                 o
@@ -3054,6 +3056,112 @@ mod tests {
         }
         let reads = store.random_read_counter.load(Ordering::Relaxed);
         assert!(reads <= 3 * n / 100);
+    }
+
+    #[test]
+    fn test_db_100k_reads_bloom_filter_false_positives() {
+        use crate::cache::lru::LRUCache;
+        use crate::filter::bloom::DEFAULT_FALSE_POSITIVE_RATE;
+
+        // The read use case: 100,000 point lookups, half of them for keys that
+        // do not exist. A false positive forces an extra data-block disk read
+        // for every layer the key is searched in, so the rate must stay near
+        // the configured 1%.
+        let total_reads = 100_000usize;
+        let existing = total_reads / 2;
+
+        let mut store = MemStorage::default();
+        store.count_random_reads = true;
+        let mut opts = Options::<BytewiseComparator>::default();
+        opts.logger_level = crate::LevelFilter::Warn;
+        // Disable the block cache so every filter miss/hit is observable as a
+        // random read against the (in-memory) storage.
+        opts.block_cache = Some(Arc::new(LRUCache::new(0)));
+        opts.filter_policy = Some(Arc::new(BloomFilter::with_false_positive_rate(
+            DEFAULT_FALSE_POSITIVE_RATE,
+        )));
+        let db_path = "bloom_filter_100k_test";
+        let mut db = WickDB::open_db(opts.clone(), db_path, store.clone()).unwrap();
+
+        for i in 0..existing {
+            db.put(
+                WriteOptions::default(),
+                key(i).as_bytes(),
+                key(i).as_bytes(),
+            )
+            .unwrap();
+        }
+        // Flush everything into sstables so every lookup goes through the
+        // filter blocks rather than the memtables.
+        db.inner.force_compact_mem_table().unwrap();
+        db.compact_range(Some(b"a"), Some(b"z")).unwrap();
+
+        fn measure<S: Storage + Clone, C: Comparator + 'static>(
+            db: &WickDB<S, C>,
+            store: &MemStorage,
+            total_reads: usize,
+        ) -> usize {
+            store.delay_data_sync.store(true, Ordering::Release);
+            store.random_read_counter.store(0, Ordering::Relaxed);
+            let mut missing_hits = 0usize;
+            for i in 0..total_reads {
+                let (k, expect_found) = if i % 2 == 0 {
+                    (key(i / 2), true)
+                } else {
+                    // Disjoint key space, guaranteed absent.
+                    (format!("missing-{}", i), false)
+                };
+                let v = db.get(ReadOptions::default(), k.as_bytes()).unwrap();
+                if expect_found {
+                    assert_eq!(v, Some(k.into_bytes()));
+                } else if v.is_some() {
+                    missing_hits += 1;
+                }
+            }
+            store.delay_data_sync.store(false, Ordering::Release);
+            assert_eq!(missing_hits, 0, "absent keys must never resolve to a value");
+            store.random_read_counter.load(Ordering::Relaxed)
+        }
+
+        let reads_before_reopen = measure(&db, &store, total_reads);
+
+        // Reopen the database. Filters are persisted inside the sstables and
+        // loaded back directly: no filter rebuild happens on startup, so the
+        // observed read amplification stays within the same false-positive
+        // bound (the exact count can differ because probes are probabilistic).
+        db.close().unwrap();
+        let db = WickDB::open_db(opts, db_path, store.clone()).unwrap();
+        let reads_after_reopen = measure(&db, &store, total_reads);
+
+        // Existing keys always need one data-block read each (50,000). Any
+        // extra random read corresponds to a bloom false positive while
+        // looking up one of the 50,000 absent keys; bound them to 2% of the
+        // absent lookups so the effective false positive rate stays near the
+        // configured 1%.
+        let bound = existing + total_reads / 50;
+        assert!(
+            reads_before_reopen <= bound,
+            "too many disk reads before reopen: {} > {}",
+            reads_before_reopen,
+            bound
+        );
+        assert!(
+            reads_after_reopen <= bound,
+            "too many disk reads after reopen: {} > {}",
+            reads_after_reopen,
+            bound
+        );
+        // Without persisted filters every absent lookup would fall through to
+        // a data-block read, adding roughly `existing` more reads. Both runs
+        // staying well under that proves the filters are active after reopen,
+        // i.e. they were loaded from the sstables rather than rebuilt.
+        let no_filter_baseline = existing * 2;
+        assert!(
+            reads_after_reopen < no_filter_baseline,
+            "persisted filter seems missing after reopen: {} reads >= {}",
+            reads_after_reopen,
+            no_filter_baseline
+        );
     }
 
     const THREAD_COUNT: usize = 4;
