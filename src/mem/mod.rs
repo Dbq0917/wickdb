@@ -66,6 +66,7 @@ impl<C: Comparator> Comparator for KeyComparator<C> {
 }
 
 /// In-memory write buffer
+#[derive(Clone)]
 pub struct MemTable<C: Comparator> {
     cmp: KeyComparator<C>,
     table: InlineSkipList<KeyComparator<C>, OffsetArena>,

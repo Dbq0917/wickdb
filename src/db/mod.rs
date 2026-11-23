@@ -117,13 +117,8 @@ impl<S: Storage + Clone, C: Comparator + 'static> DB for WickDB<S, C> {
     }
 
     fn iter(&self, read_opt: ReadOptions) -> Result<Self::Iterator> {
-        let internal_iter = self.internal_iter(read_opt)?;
+        let (internal_iter, sequence) = self.internal_iter_with_sequence(read_opt)?;
         let ucmp = self.inner.internal_comparator.user_comparator.clone();
-        let sequence = if let Some(snapshot) = &read_opt.snapshot {
-            snapshot.sequence()
-        } else {
-            self.inner.versions.lock().unwrap().last_sequence()
-        };
         Ok(DBIterator::new(
             internal_iter,
             self.inner.clone(),
@@ -395,22 +390,31 @@ impl<S: Storage + Clone, C: Comparator + 'static> WickDB<S, C> {
     }
 
     fn internal_iter(&self, read_opt: ReadOptions) -> Result<InternalIterator<S, C>> {
+        self.internal_iter_with_sequence(read_opt)
+            .map(|(iter, _)| iter)
+    }
+
+    fn internal_iter_with_sequence(
+        &self,
+        read_opt: ReadOptions,
+    ) -> Result<(InternalIterator<S, C>, u64)> {
+        let versions = self.inner.versions.lock().unwrap();
+        let sequence = if let Some(snapshot) = &read_opt.snapshot {
+            snapshot.sequence()
+        } else {
+            versions.last_sequence()
+        };
         let mut mem_iters = vec![self.inner.mem.read().unwrap().iter()];
         if let Some(im_mem) = self.inner.im_mem.read().unwrap().as_ref() {
             mem_iters.push(im_mem.iter());
         }
-        let sst_iter = self
-            .inner
-            .versions
-            .lock()
-            .unwrap()
-            .current_sst_iter(read_opt, self.inner.table_cache.clone())?;
+        let sst_iter = versions.current_sst_iter(read_opt, self.inner.table_cache.clone())?;
         let iter_core = DBIteratorCore::new(
             self.inner.internal_comparator.clone(),
             mem_iters,
             vec![sst_iter],
         );
-        Ok(KMergeIter::new(iter_core))
+        Ok((KMergeIter::new(iter_core), sequence))
     }
 }
 
@@ -512,13 +516,22 @@ impl<S: Storage + Clone + 'static, C: Comparator + 'static> DBImpl<S, C> {
         if self.is_shutting_down.load(Ordering::Acquire) {
             return Err(Error::DBClosed("get request".to_owned()));
         }
+        // Pin the sequence number, memtables and on-disk version at the same
+        // point in time. A compaction may install a new version while we read
+        // the returned SSTables, but it cannot change what this read observes.
+        let versions = self.versions.lock().unwrap();
         let snapshot = match &options.snapshot {
             Some(snapshot) => snapshot.sequence(),
-            None => self.versions.lock().unwrap().last_sequence(),
+            None => versions.last_sequence(),
         };
+        let mem_table = self.mem.read().unwrap().clone();
+        let im_mem = self.im_mem.read().unwrap().clone();
+        let current = versions.current();
+        mem::drop(versions);
+
         let lookup_key = LookupKey::new(key, snapshot);
         // search the memtable
-        if let Some(result) = self.mem.read().unwrap().get(&lookup_key) {
+        if let Some(result) = mem_table.get(&lookup_key) {
             match result {
                 Ok(value) => return Ok(Some(value.to_vec())),
                 // mem.get only returns Err() when it get a Deletion of the key
@@ -526,7 +539,7 @@ impl<S: Storage + Clone + 'static, C: Comparator + 'static> DBImpl<S, C> {
             }
         }
         // search the immutable memtable
-        if let Some(im_mem) = self.im_mem.read().unwrap().as_ref() {
+        if let Some(im_mem) = im_mem.as_ref() {
             if let Some(result) = im_mem.get(&lookup_key) {
                 match result {
                     Ok(value) => return Ok(Some(value.to_vec())),
@@ -534,7 +547,6 @@ impl<S: Storage + Clone + 'static, C: Comparator + 'static> DBImpl<S, C> {
                 }
             }
         }
-        let current = self.versions.lock().unwrap().current();
         let (value, seek_stats) = current.get(options, lookup_key, &self.table_cache)?;
         if current.update_stats(seek_stats) {
             self.maybe_schedule_compaction(current);
